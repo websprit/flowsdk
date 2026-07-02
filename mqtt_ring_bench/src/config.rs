@@ -15,6 +15,10 @@ pub struct BenchConfig {
     pub interval_ms: u64,
     pub keep_alive: u16,
     pub mqtt_version: u8,
+    /// Optional MQTT username for broker authentication.
+    pub username: Option<String>,
+    /// Optional MQTT password for broker authentication.
+    pub password: Option<String>,
     pub workers: usize,
     pub connect_rate: usize,
     pub socket_buf: usize,
@@ -66,6 +70,12 @@ struct BenchArgs {
     #[arg(long = "mqtt-version", default_value_t = 5)]
     mqtt_version: u8,
 
+    #[arg(long)]
+    username: Option<String>,
+
+    #[arg(long)]
+    password: Option<String>,
+
     #[arg(long, default_value_t = num_cpus())]
     workers: usize,
 
@@ -107,6 +117,8 @@ impl Default for BenchConfig {
             interval_ms: 0,
             keep_alive: 60,
             mqtt_version: 5,
+            username: None,
+            password: None,
             workers: num_cpus(),
             connect_rate: 1000,
             socket_buf: 2048,
@@ -145,6 +157,8 @@ pub fn parse_args() -> BenchConfig {
         interval_ms: args.interval,
         keep_alive: args.keep_alive,
         mqtt_version: args.mqtt_version,
+        username: args.username,
+        password: args.password,
         workers: args.workers,
         connect_rate: args.connect_rate,
         socket_buf: args.socket_buf,

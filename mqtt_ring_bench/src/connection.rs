@@ -45,7 +45,7 @@ impl Connection {
     pub fn new(fd: RawFd, client_index: usize, config: &BenchConfig) -> Self {
         let peer = format!("{}:{}", config.host, config.port);
         let client_id = format!("mqtt_ring_bench_{}", client_index);
-        let options = MqttClientOptions::builder()
+        let mut options = MqttClientOptions::builder()
             .peer(&peer)
             .client_id(&client_id)
             .keep_alive(config.keep_alive)
@@ -55,8 +55,9 @@ impl Connection {
             .auto_ack(true)
             .parser_buffer_size(config.parser_buf)
             .max_outgoing_packet_count(config.messages.min(10_000) as usize)
-            .max_event_count(1000)
-            .build();
+            .max_event_count(1000);
+        options = apply_auth(options, config);
+        let options = options.build();
 
         Self {
             fd,
@@ -246,6 +247,16 @@ impl Connection {
     }
 }
 
+fn apply_auth(mut options: MqttClientOptions, config: &BenchConfig) -> MqttClientOptions {
+    if let Some(username) = &config.username {
+        options = options.username(username.clone());
+    }
+    if let Some(password) = &config.password {
+        options = options.password(password.as_bytes().to_vec());
+    }
+    options
+}
+
 #[derive(Default)]
 pub struct EventOutcome {
     pub connected: bool,
@@ -304,7 +315,7 @@ impl QuicConnection {
     ) -> Result<Self, String> {
         let peer = format!("{}:{}", config.host, config.port);
         let client_id = format!("mqtt_ring_bench_{}", client_index);
-        let options = MqttClientOptions::builder()
+        let mut options = MqttClientOptions::builder()
             .peer(&peer)
             .client_id(&client_id)
             .keep_alive(config.keep_alive)
@@ -314,8 +325,9 @@ impl QuicConnection {
             .auto_ack(true)
             .parser_buffer_size(config.parser_buf)
             .max_outgoing_packet_count(config.messages.min(10_000) as usize)
-            .max_event_count(1000)
-            .build();
+            .max_event_count(1000);
+        options = apply_auth(options, config);
+        let options = options.build();
 
         let engine =
             QuicMqttEngine::new(options).map_err(|e| format!("QuicMqttEngine::new: {}", e))?;

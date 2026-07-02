@@ -114,3 +114,7 @@ required-features = ["quic"]
 [[example]]
 name = "tokio_async_mqtt_quic_example"
 required-features = ["quic"]
+
+[[example]]
+name = "quic_stability_check"
+required-features = ["quic"]

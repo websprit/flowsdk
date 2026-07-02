@@ -73,6 +73,8 @@ OPTIONS:
     --interval <MS>           Delay between publishes per client, 0 = max speed [default: 0]
     --keep-alive <SECS>       MQTT keep-alive [default: 60]
     --mqtt-version <3|4|5>    Protocol version [default: 5]
+    --username <USERNAME>     MQTT username for broker authentication
+    --password <PASSWORD>     MQTT password for broker authentication
     --workers <N>             Worker threads [default: num_cpus]
     --connect-rate <N>        Connections/sec during ramp-up [default: 1000]
     --socket-buf <BYTES>      SO_RCVBUF/SO_SNDBUF per socket [default: 2048]
@@ -104,6 +106,11 @@ mqtt_ring_bench --host 10.0.0.1 --clients 5000 --messages 100000 \
 # QUIC: connect to EMQX QUIC port (requires --features quic build)
 mqtt_ring_bench --quic --quic-insecure --host broker.emqx.io --port 14567 \
     --clients 10 --messages 100 --qos 1
+
+# QUIC with MQTT username/password authentication
+mqtt_ring_bench --quic --host 10.0.0.1 --port 14567 \
+    --username bench_user --password bench_secret \
+    --clients 1000 --messages 500 --qos 1
 
 # QUIC: with custom TLS SNI name
 mqtt_ring_bench --quic --host 10.0.0.1 --port 14567 \

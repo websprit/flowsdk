@@ -37,6 +37,7 @@ python/package/flowsdk.egg-info/
 
 # Kotlin Examples (generated files)
 kotlin/package/src/main/resources/libflowsdk_ffi.dylib
+kotlin/examples/android_quic_stability/src/main/jniLibs/
 kotlin/.gradle/
 kotlin/build/
 kotlin/**/build/

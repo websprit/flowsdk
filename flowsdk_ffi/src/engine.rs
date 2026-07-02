@@ -11,6 +11,13 @@ use ffi_types::*;
 
 use std::sync::Mutex;
 
+#[cfg(all(target_os = "android", any(feature = "tls", feature = "quic")))]
+use jni::{
+    objects::{JClass, JObject},
+    sys::jboolean,
+    EnvUnowned, Outcome,
+};
+
 #[cfg_attr(feature = "uniffi-bindings", derive(uniffi::Object))]
 pub struct MqttEngineFFI {
     engine: Mutex<MqttEngine>,
@@ -24,6 +31,23 @@ use flowsdk::mqtt_client::engine::QuicMqttEngine;
 use flowsdk::mqtt_client::tls_engine::TlsMqttEngine;
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+#[cfg(all(target_os = "android", any(feature = "tls", feature = "quic")))]
+#[export_name = "Java_io_emqx_flowsdk_examples_quicstability_PlatformVerifierNative_init"]
+pub extern "C" fn android_platform_verifier_init(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    context: JObject<'_>,
+) -> jboolean {
+    let outcome = env
+        .with_env(|env| rustls_platform_verifier::android::init_with_env(env, context))
+        .into_outcome();
+
+    match outcome {
+        Outcome::Ok(()) => true,
+        Outcome::Err(_) | Outcome::Panic(_) => false,
+    }
+}
 
 #[cfg_attr(feature = "uniffi-bindings", uniffi::export)]
 impl MqttEngineFFI {
@@ -257,6 +281,26 @@ impl TlsMqttEngineFFI {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier))
                 .with_no_client_auth()
+        } else if tls_opts.ca_cert_file.is_none() {
+            #[cfg(target_os = "android")]
+            {
+                use rustls_platform_verifier::BuilderVerifierExt;
+
+                crypto_builder
+                    .with_platform_verifier()
+                    .expect("Android platform verifier must be initialized before QUIC connect")
+                    .with_no_client_auth()
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let mut root_store = rustls::RootCertStore::empty();
+                for cert in rustls_native_certs::load_native_certs().unwrap_or_default() {
+                    root_store.add(cert).ok();
+                }
+                crypto_builder
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth()
+            }
         } else {
             let mut root_store = rustls::RootCertStore::empty();
             if let Some(ca_path) = tls_opts.ca_cert_file {
@@ -501,15 +545,24 @@ pub struct QuicMqttEngineFFI {
 impl QuicMqttEngineFFI {
     #[cfg_attr(feature = "uniffi-bindings", uniffi::constructor)]
     pub fn new(opts: MqttOptionsFFI) -> Self {
-        let options = MqttClientOptions::builder()
+        let mut builder = MqttClientOptions::builder()
             .client_id(opts.client_id)
             .mqtt_version(opts.mqtt_version)
             .clean_start(opts.clean_start)
             .keep_alive(opts.keep_alive)
             .reconnect_base_delay_ms(opts.reconnect_base_delay_ms)
             .reconnect_max_delay_ms(opts.reconnect_max_delay_ms)
-            .max_reconnect_attempts(opts.max_reconnect_attempts)
-            .build();
+            .max_reconnect_attempts(opts.max_reconnect_attempts);
+
+        if let Some(username) = opts.username {
+            builder = builder.username(username);
+        }
+
+        if let Some(password) = opts.password {
+            builder = builder.password(password);
+        }
+
+        let options = builder.build();
 
         let engine = QuicMqttEngine::new(options).unwrap();
         QuicMqttEngineFFI {
@@ -540,6 +593,26 @@ impl QuicMqttEngineFFI {
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier))
                 .with_no_client_auth()
+        } else if tls_opts.ca_cert_file.is_none() {
+            #[cfg(target_os = "android")]
+            {
+                use rustls_platform_verifier::BuilderVerifierExt;
+
+                crypto_builder
+                    .with_platform_verifier()
+                    .expect("Android platform verifier must be initialized before QUIC connect")
+                    .with_no_client_auth()
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let mut root_store = rustls::RootCertStore::empty();
+                for cert in rustls_native_certs::load_native_certs().unwrap_or_default() {
+                    root_store.add(cert).ok();
+                }
+                crypto_builder
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth()
+            }
         } else {
             let mut root_store = rustls::RootCertStore::empty();
             if let Some(ca_path) = tls_opts.ca_cert_file {
@@ -551,10 +624,6 @@ impl QuicMqttEngineFFI {
                     for cert in certs {
                         root_store.add(cert).ok();
                     }
-                }
-            } else {
-                for cert in rustls_native_certs::load_native_certs().unwrap_or_default() {
-                    root_store.add(cert).ok();
                 }
             }
             crypto_builder
