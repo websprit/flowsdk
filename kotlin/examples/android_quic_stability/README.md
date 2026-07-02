@@ -17,20 +17,26 @@ TLS verification uses Android's platform verifier via `rustls-platform-verifier`
 
 ## Build
 
-Generate Kotlin UniFFI bindings first:
+Generate Kotlin UniFFI bindings first. This creates the Kotlin wrapper used by
+the Android app:
 
 ```bash
 JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home \
   ./scripts/build_kotlin_bindings.sh
 ```
 
-Build Android native libraries for the target ABIs and copy them into:
+Build the Android native library next. `libflowsdk_ffi.so` is produced from the
+Rust crate `flowsdk_ffi`, whose `Cargo.toml` declares `cdylib` output. The
+Android app loads this library with `System.loadLibrary("flowsdk_ffi")`.
+
+The easiest way to build and place it correctly is `cargo ndk`. It cross
+compiles `flowsdk_ffi` for the selected Android ABI and copies the output into:
 
 ```text
 kotlin/examples/android_quic_stability/src/main/jniLibs/<abi>/libflowsdk_ffi.so
 ```
 
-For example:
+For example, for an arm64 phone:
 
 ```bash
 PATH="$HOME/.cargo/bin:$PATH" \
@@ -38,6 +44,16 @@ ANDROID_HOME="$HOME/Library/Android/sdk" \
 cargo ndk -t arm64-v8a -o kotlin/examples/android_quic_stability/src/main/jniLibs \
   build -p flowsdk_ffi --features quic --release
 ```
+
+After this command, the expected generated file is:
+
+```text
+kotlin/examples/android_quic_stability/src/main/jniLibs/arm64-v8a/libflowsdk_ffi.so
+```
+
+For other devices, replace `arm64-v8a` with the ABI you need, such as `x86_64`
+for many emulators. The `jniLibs/` directory is generated build output and is
+ignored by git.
 
 Then build the APK:
 
