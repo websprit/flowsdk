@@ -13,9 +13,10 @@ use std::sync::Mutex;
 
 #[cfg(all(target_os = "android", any(feature = "tls", feature = "quic")))]
 use jni::{
-    objects::{JClass, JObject},
-    sys::jboolean,
-    EnvUnowned, Outcome,
+    jni_sig, jni_str,
+    objects::{Global, JClass, JObject, JString, Reference},
+    sys::{jboolean, jint, jlong},
+    EnvUnowned, JValue, JavaVM, Outcome,
 };
 
 #[cfg_attr(feature = "uniffi-bindings", derive(uniffi::Object))]
@@ -47,6 +48,537 @@ pub extern "C" fn android_platform_verifier_init(
         Outcome::Ok(()) => true,
         Outcome::Err(_) | Outcome::Panic(_) => false,
     }
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+struct NativeQuicRunnerHandle {
+    running: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+#[derive(Clone)]
+struct NativeQuicRunnerConfig {
+    host: String,
+    port: u16,
+    server_name: String,
+    username: Option<String>,
+    password: Option<String>,
+    clients: usize,
+    duration_secs: u64,
+    keep_alive_secs: u16,
+    insecure_skip_verify: bool,
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+#[derive(Default)]
+struct NativeQuicRunnerStats {
+    connected: std::sync::atomic::AtomicU64,
+    completed: std::sync::atomic::AtomicU64,
+    connect_failed: std::sync::atomic::AtomicU64,
+    ping_responses: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU64,
+    connection_lost: std::sync::atomic::AtomicU64,
+    disconnected: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+#[export_name = "Java_io_emqx_flowsdk_examples_quicstability_NativeQuicStabilityRunner_startNative"]
+pub extern "C" fn android_native_quic_stability_start(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    host: JString<'_>,
+    port: jint,
+    server_name: JString<'_>,
+    username: JString<'_>,
+    password: JString<'_>,
+    clients: jint,
+    duration_secs: jlong,
+    keep_alive_secs: jint,
+    insecure_skip_verify: jboolean,
+    callback: JObject<'_>,
+) -> jlong {
+    let outcome = env
+        .with_env(|env| {
+            let host = java_string(env, &host).unwrap_or_default();
+            let server_name = java_string(env, &server_name).unwrap_or_else(|| host.clone());
+            let username = java_string(env, &username).filter(|s| !s.is_empty());
+            let password = java_string(env, &password).filter(|s| !s.is_empty());
+            let callback = Arc::new(env.new_global_ref(callback)?);
+            let vm = Arc::new(env.get_java_vm()?);
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let config = NativeQuicRunnerConfig {
+                host,
+                port: port.clamp(1, u16::MAX as jint) as u16,
+                server_name,
+                username,
+                password,
+                clients: clients.max(1) as usize,
+                duration_secs: duration_secs.max(1) as u64,
+                keep_alive_secs: keep_alive_secs.clamp(1, u16::MAX as jint) as u16,
+                insecure_skip_verify,
+            };
+            let thread_running = Arc::clone(&running);
+            let thread = std::thread::spawn(move || {
+                run_native_quic_stability(config, thread_running, vm, callback);
+            });
+            let handle = Box::new(NativeQuicRunnerHandle {
+                running,
+                thread: Some(thread),
+            });
+            Ok::<jlong, jni::errors::Error>(Box::into_raw(handle) as jlong)
+        })
+        .into_outcome();
+
+    match outcome {
+        Outcome::Ok(handle) => handle,
+        Outcome::Err(_) | Outcome::Panic(_) => 0,
+    }
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+#[export_name = "Java_io_emqx_flowsdk_examples_quicstability_NativeQuicStabilityRunner_stopNative"]
+pub extern "C" fn android_native_quic_stability_stop(
+    _env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    handle: jlong,
+) {
+    if handle == 0 {
+        return;
+    }
+
+    let mut handle = unsafe { Box::from_raw(handle as *mut NativeQuicRunnerHandle) };
+    handle
+        .running
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Some(thread) = handle.thread.take() {
+        let _ = thread.join();
+    }
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn java_string(env: &jni::Env<'_>, value: &JString<'_>) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    value.mutf8_chars(env).ok().map(|chars| chars.to_string())
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn native_log(vm: &JavaVM, callback: &Global<JObject>, line: impl AsRef<str>) {
+    let line = line.as_ref().to_string();
+    let _ = vm.attach_current_thread(|env| {
+        let jline = env.new_string(line)?;
+        env.call_method(
+            callback.as_ref(),
+            jni_str!("onLog"),
+            jni_sig!("(Ljava/lang/String;)V"),
+            &[JValue::Object(jline.as_ref())],
+        )?;
+        Ok::<(), jni::errors::Error>(())
+    });
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn run_native_quic_stability(
+    config: NativeQuicRunnerConfig,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    vm: Arc<JavaVM>,
+    callback: Arc<Global<JObject>>,
+) {
+    let stats = Arc::new(NativeQuicRunnerStats::default());
+    let connect_latencies_ms = Arc::new(Mutex::new(Vec::with_capacity(config.clients)));
+
+    native_log(
+        &vm,
+        &callback,
+        "MQTT over QUIC Android connection stability check",
+    );
+    native_log(
+        &vm,
+        &callback,
+        format!("  target: quic://{}:{}", config.host, config.port),
+    );
+    native_log(
+        &vm,
+        &callback,
+        format!("  server_name: {}", config.server_name),
+    );
+    native_log(&vm, &callback, format!("  clients: {}", config.clients));
+    native_log(
+        &vm,
+        &callback,
+        format!("  duration: {}s", config.duration_secs),
+    );
+    native_log(
+        &vm,
+        &callback,
+        format!("  keep_alive: {}s", config.keep_alive_secs),
+    );
+    native_log(&vm, &callback, "  publish/subscribe: disabled");
+    native_log(
+        &vm,
+        &callback,
+        format!(
+            "  tls_verify: {}",
+            if config.insecure_skip_verify {
+                "off"
+            } else {
+                "on"
+            }
+        ),
+    );
+    native_log(
+        &vm,
+        &callback,
+        format!(
+            "  auth: {}",
+            if config.username.is_some() || config.password.is_some() {
+                "configured"
+            } else {
+                "disabled"
+            }
+        ),
+    );
+    native_log(&vm, &callback, "  runner: native");
+
+    let mut client_threads = Vec::with_capacity(config.clients);
+    for index in 0..config.clients {
+        let client_config = config.clone();
+        let client_running = Arc::clone(&running);
+        let client_stats = Arc::clone(&stats);
+        let client_latencies = Arc::clone(&connect_latencies_ms);
+        let client_vm = Arc::clone(&vm);
+        let client_callback = Arc::clone(&callback);
+        client_threads.push(std::thread::spawn(move || {
+            native_run_client(
+                index,
+                client_config,
+                client_running,
+                client_stats,
+                client_latencies,
+                client_vm,
+                client_callback,
+            )
+        }));
+    }
+
+    let mut next_report = Instant::now() + Duration::from_secs(5);
+    while running.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(100));
+        if Instant::now() >= next_report {
+            native_log(&vm, &callback, native_snapshot_line(&stats));
+            next_report = Instant::now() + Duration::from_secs(5);
+        }
+        if stats.completed.load(std::sync::atomic::Ordering::Relaxed) >= config.clients as u64 {
+            running.store(false, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
+    }
+
+    for thread in client_threads {
+        if thread.join().is_err() {
+            stats
+                .errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    if stats.completed.load(std::sync::atomic::Ordering::Relaxed) >= config.clients as u64 {
+        native_log(&vm, &callback, "Final result");
+        native_log(&vm, &callback, native_snapshot_line(&stats));
+        native_log(
+            &vm,
+            &callback,
+            native_connect_latency_summary(&connect_latencies_ms),
+        );
+        let failed = stats
+            .connect_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            + stats.errors.load(std::sync::atomic::Ordering::Relaxed)
+            + stats
+                .connection_lost
+                .load(std::sync::atomic::Ordering::Relaxed)
+            + stats
+                .disconnected
+                .load(std::sync::atomic::Ordering::Relaxed);
+        native_log(
+            &vm,
+            &callback,
+            format!("status: {}", if failed == 0 { "PASS" } else { "FAIL" }),
+        );
+    } else {
+        native_log(&vm, &callback, "Stopped");
+        native_log(&vm, &callback, native_snapshot_line(&stats));
+        native_log(
+            &vm,
+            &callback,
+            native_connect_latency_summary(&connect_latencies_ms),
+        );
+    }
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn native_run_client(
+    index: usize,
+    config: NativeQuicRunnerConfig,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    stats: Arc<NativeQuicRunnerStats>,
+    connect_latencies_ms: Arc<Mutex<Vec<u128>>>,
+    vm: Arc<JavaVM>,
+    callback: Arc<Global<JObject>>,
+) {
+    let started = Instant::now();
+    let client_id = format!(
+        "android_quic_stability_native_{}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        index
+    );
+
+    if let Err(err) = native_run_client_inner(
+        index,
+        &config,
+        Arc::clone(&running),
+        Arc::clone(&stats),
+        Arc::clone(&connect_latencies_ms),
+        &vm,
+        &callback,
+        &client_id,
+        started,
+    ) {
+        stats
+            .errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        native_log(
+            &vm,
+            &callback,
+            format!("client {} exception: {}", index, err),
+        );
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn native_run_client_inner(
+    index: usize,
+    config: &NativeQuicRunnerConfig,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    stats: Arc<NativeQuicRunnerStats>,
+    connect_latencies_ms: Arc<Mutex<Vec<u128>>>,
+    vm: &JavaVM,
+    callback: &Global<JObject>,
+    client_id: &str,
+    started: Instant,
+) -> Result<(), String> {
+    use std::io::ErrorKind;
+    use std::net::{ToSocketAddrs, UdpSocket};
+
+    let broker_addr = format!("{}:{}", config.host, config.port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve broker: {}", e))?
+        .next()
+        .ok_or_else(|| "resolve broker: no address".to_string())?;
+    let server_addr = broker_addr.to_string();
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind UDP: {}", e))?;
+    socket
+        .connect(broker_addr)
+        .map_err(|e| format!("connect UDP: {}", e))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("set nonblocking: {}", e))?;
+
+    let opts = MqttOptionsFFI {
+        client_id: client_id.to_string(),
+        mqtt_version: 5,
+        clean_start: true,
+        keep_alive: config.keep_alive_secs,
+        username: config.username.clone(),
+        password: config.password.clone(),
+        reconnect_base_delay_ms: 1000,
+        reconnect_max_delay_ms: 10000,
+        max_reconnect_attempts: 0,
+    };
+    let engine = QuicMqttEngineFFI::new(opts);
+    let tls_opts = MqttTlsOptionsFFI {
+        ca_cert_file: None,
+        client_cert_file: None,
+        client_key_file: None,
+        insecure_skip_verify: config.insecure_skip_verify,
+        alpn_protocols: Vec::new(),
+        enable_key_log: false,
+    };
+
+    let connect_started = Instant::now();
+    engine.connect(
+        server_addr.clone(),
+        config.server_name.clone(),
+        tls_opts,
+        started.elapsed().as_millis() as u64,
+    );
+    engine.handle_tick(started.elapsed().as_millis() as u64);
+    native_send_outgoing(&engine, &socket, true)?;
+
+    let mut recv_buf = [0u8; 65536];
+    let mut connected = false;
+    let mut completed = false;
+
+    while running.load(std::sync::atomic::Ordering::Relaxed)
+        && started.elapsed() < Duration::from_secs(config.duration_secs)
+    {
+        loop {
+            match socket.recv(&mut recv_buf) {
+                Ok(len) => engine.handle_datagram(
+                    recv_buf[..len].to_vec(),
+                    server_addr.clone(),
+                    started.elapsed().as_millis() as u64,
+                ),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => return Err(format!("recv UDP: {}", err)),
+            }
+        }
+
+        for event in engine.handle_tick(started.elapsed().as_millis() as u64) {
+            match event {
+                MqttEventFFI::Connected(result) => {
+                    if result.reason_code == 0 && !connected {
+                        connected = true;
+                        let latency_ms = connect_started.elapsed().as_millis();
+                        connect_latencies_ms.lock().unwrap().push(latency_ms);
+                        stats
+                            .connected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        native_log(
+                            vm,
+                            callback,
+                            format!("client {} connected in {}ms", index, latency_ms),
+                        );
+                    } else if result.reason_code != 0 {
+                        stats
+                            .connect_failed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        native_log(
+                            vm,
+                            callback,
+                            format!(
+                                "client {} connect rejected reason={}",
+                                index, result.reason_code
+                            ),
+                        );
+                        running.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                MqttEventFFI::PingResponse { success } => {
+                    if success {
+                        stats
+                            .ping_responses
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                MqttEventFFI::Disconnected { reason_code } => {
+                    stats
+                        .disconnected
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    native_log(
+                        vm,
+                        callback,
+                        format!("client {} disconnected reason={:?}", index, reason_code),
+                    );
+                    running.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                MqttEventFFI::ReconnectNeeded => {
+                    stats
+                        .connection_lost
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    native_log(
+                        vm,
+                        callback,
+                        format!("client {} connection lost: reconnect needed", index),
+                    );
+                    running.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                MqttEventFFI::Error { message } => {
+                    stats
+                        .errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    native_log(vm, callback, format!("client {} error: {}", index, message));
+                    running.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        native_send_outgoing(&engine, &socket, true)?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    if connected && started.elapsed() >= Duration::from_secs(config.duration_secs) {
+        completed = true;
+        stats
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    engine.disconnect();
+    engine.handle_tick(started.elapsed().as_millis() as u64);
+    let _ = native_send_outgoing(&engine, &socket, false);
+    if !completed && connected {
+        native_log(
+            vm,
+            callback,
+            format!("client {} stopped before completion", index),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn native_send_outgoing(
+    engine: &QuicMqttEngineFFI,
+    socket: &std::net::UdpSocket,
+    fail_on_error: bool,
+) -> Result<(), String> {
+    for datagram in engine.take_outgoing_datagrams() {
+        if let Err(err) = socket.send(&datagram.data) {
+            if fail_on_error {
+                return Err(format!("send UDP: {}", err));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn native_snapshot_line(stats: &NativeQuicRunnerStats) -> String {
+    format!(
+        "connected: {} | completed: {} | connect_failed: {} | ping_responses: {} | errors: {} | connection_lost: {} | disconnected: {}",
+        stats.connected.load(std::sync::atomic::Ordering::Relaxed),
+        stats.completed.load(std::sync::atomic::Ordering::Relaxed),
+        stats.connect_failed.load(std::sync::atomic::Ordering::Relaxed),
+        stats.ping_responses.load(std::sync::atomic::Ordering::Relaxed),
+        stats.errors.load(std::sync::atomic::Ordering::Relaxed),
+        stats.connection_lost.load(std::sync::atomic::Ordering::Relaxed),
+        stats.disconnected.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+#[cfg(all(target_os = "android", feature = "quic"))]
+fn native_connect_latency_summary(connect_latencies_ms: &Arc<Mutex<Vec<u128>>>) -> String {
+    let values = connect_latencies_ms.lock().unwrap();
+    if values.is_empty() {
+        return "connect_latency_ms: no successful connections".to_string();
+    }
+    let min = values.iter().min().copied().unwrap_or(0);
+    let max = values.iter().max().copied().unwrap_or(0);
+    let sum: u128 = values.iter().sum();
+    let avg = sum as f64 / values.len() as f64;
+    format!(
+        "connect_latency_ms: count={} min={} avg={:.2} max={}",
+        values.len(),
+        min,
+        avg,
+        max
+    )
 }
 
 #[cfg_attr(feature = "uniffi-bindings", uniffi::export)]

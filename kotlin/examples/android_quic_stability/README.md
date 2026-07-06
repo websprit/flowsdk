@@ -1,6 +1,9 @@
 # Android QUIC Stability Example
 
 Android example for holding MQTT over QUIC connections without publish/subscribe traffic.
+The UI owns only configuration, start/stop, and log display. The default runner
+uses native UDP transport inside `libflowsdk_ffi.so`, while Rust continues to
+own the QUIC and MQTT protocol state machines.
 
 Scenario:
 
@@ -14,6 +17,23 @@ Scenario:
 
 The password field uses Android's password input mode, so the value is masked on screen.
 TLS verification uses Android's platform verifier via `rustls-platform-verifier`.
+
+## Runtime Architecture
+
+```text
+Android UI
+  -> NativeQuicStabilityRunner.startNative(...)
+  -> libflowsdk_ffi.so native runner
+  -> UDP socket send/receive in native code
+  -> QuicMqttEngineFFI / QuicMqttEngine
+  -> MQTT over QUIC events
+  -> NativeLogCallback.onLog(...)
+  -> Android UI log view
+```
+
+The previous Kotlin UDP loop remains in the source as `KotlinQuicStabilityRunner`
+for comparison, but the app starts `NativeQuicStabilityRunnerInstance` by
+default.
 
 ## Build
 

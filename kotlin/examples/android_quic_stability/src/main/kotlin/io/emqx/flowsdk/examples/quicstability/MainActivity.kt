@@ -18,6 +18,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.net.InetSocketAddress
+import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.channels.DatagramChannel
 import java.nio.channels.SelectionKey
@@ -34,7 +35,7 @@ import uniffi.flowsdk_ffi.QuicMqttEngineFfi
 
 class MainActivity : Activity() {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var runner: QuicStabilityRunner? = null
+    private var runner: StabilityRunner? = null
     private lateinit var prefs: SharedPreferences
 
     private lateinit var logView: TextView
@@ -101,19 +102,26 @@ class MainActivity : Activity() {
             setOnClickListener {
                 logView.text = ""
                 runner?.stop()
-                val host = hostInput.text.toString().trim()
-                val port = portInput.text.toString().trim().toIntOrNull()
-                val serverName = serverNameInput.text.toString().trim().ifBlank { host }
-                if (host.isBlank() || port == null || port !in 1..65535) {
+                val target = parseTargetInput(
+                    rawHost = hostInput.text.toString(),
+                    rawPort = portInput.text.toString(),
+                    rawServerName = serverNameInput.text.toString(),
+                )
+                if (target == null) {
                     appendLog("Host and valid port are required.")
                     return@setOnClickListener
                 }
+                hostInput.setText(target.host)
+                portInput.setText(target.port.toString())
+                if (serverNameInput.text.toString().trim().isBlank()) {
+                    serverNameInput.setText("")
+                }
                 saveInputs()
-                val activeRunner = QuicStabilityRunner(
+                val activeRunner = NativeQuicStabilityRunnerInstance(
                     config = StabilityConfig(
-                        host = host,
-                        port = port,
-                        serverName = serverName,
+                        host = target.host,
+                        port = target.port,
+                        serverName = target.serverName,
                         username = usernameInput.text.toString().ifBlank { null },
                         password = passwordInput.text.toString().ifBlank { null },
                         clients = 10,
@@ -301,17 +309,140 @@ private data class StabilityConfig(
     val insecureSkipVerify: Boolean,
 )
 
-private class QuicStabilityRunner(
-    private val config: StabilityConfig,
+private data class TargetInput(
+    val host: String,
+    val port: Int,
+    val serverName: String,
+)
+
+private fun parseTargetInput(
+    rawHost: String,
+    rawPort: String,
+    rawServerName: String,
+): TargetInput? {
+    val hostText = rawHost.trim()
+    val portText = rawPort.trim()
+    if (hostText.isBlank()) {
+        return null
+    }
+
+    val parsedUri = parseTargetUri(hostText)
+    val host = parsedUri?.host ?: hostText.substringBeforeLast(':').takeIf {
+        hostText.count { ch -> ch == ':' } == 1 && hostText.substringAfterLast(':').toIntOrNull() != null
+    } ?: hostText.removePrefix("quic://").substringBefore('/')
+
+    val embeddedPort = parsedUri?.port?.takeIf { it > 0 } ?: hostText.substringAfterLast(':')
+        .toIntOrNull()
+        ?.takeIf { hostText.count { ch -> ch == ':' } == 1 }
+    val port = portText.toIntOrNull() ?: embeddedPort
+    if (host.isBlank() || port == null || port !in 1..65535) {
+        return null
+    }
+
+    val explicitServerName = rawServerName.trim()
+    val serverName = if (explicitServerName.isBlank()) {
+        host
+    } else {
+        parseTargetUri(explicitServerName)?.host
+            ?: explicitServerName.removePrefix("quic://").substringBefore('/').substringBefore(':')
+    }
+
+    return TargetInput(host = host, port = port, serverName = serverName)
+}
+
+private fun parseTargetUri(value: String): URI? {
+    return try {
+        val uri = URI(value)
+        if (uri.scheme != null && !uri.host.isNullOrBlank()) uri else null
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+private interface StabilityRunner {
+    fun start()
+    fun stop()
+}
+
+private object NativeQuicStabilityRunner {
+    init {
+        System.loadLibrary("flowsdk_ffi")
+    }
+
+    @JvmStatic
+    external fun startNative(
+        host: String,
+        port: Int,
+        serverName: String,
+        username: String?,
+        password: String?,
+        clients: Int,
+        durationSecs: Long,
+        keepAliveSecs: Int,
+        insecureSkipVerify: Boolean,
+        callback: NativeLogCallback,
+    ): Long
+
+    @JvmStatic
+    external fun stopNative(handle: Long)
+}
+
+private class NativeLogCallback(
     private val onLog: (String) -> Unit,
 ) {
+    fun onLog(line: String) {
+        onLog.invoke(line)
+    }
+}
+
+private class NativeQuicStabilityRunnerInstance(
+    private val config: StabilityConfig,
+    private val onLog: (String) -> Unit,
+) : StabilityRunner {
+    private var handle: Long = 0
+
+    override fun start() {
+        if (handle != 0L) {
+            onLog("already running")
+            return
+        }
+        handle = NativeQuicStabilityRunner.startNative(
+            host = config.host,
+            port = config.port,
+            serverName = config.serverName,
+            username = config.username,
+            password = config.password,
+            clients = config.clients,
+            durationSecs = config.durationSecs,
+            keepAliveSecs = config.keepAliveSecs.toInt(),
+            insecureSkipVerify = config.insecureSkipVerify,
+            callback = NativeLogCallback(onLog),
+        )
+        if (handle == 0L) {
+            onLog("native runner failed to start")
+        }
+    }
+
+    override fun stop() {
+        val activeHandle = handle
+        handle = 0
+        if (activeHandle != 0L) {
+            NativeQuicStabilityRunner.stopNative(activeHandle)
+        }
+    }
+}
+
+private class KotlinQuicStabilityRunner(
+    private val config: StabilityConfig,
+    private val onLog: (String) -> Unit,
+) : StabilityRunner {
     private val running = AtomicBoolean(false)
     private val executor = Executors.newCachedThreadPool()
     private val stats = StabilityStats()
     private val connectLatenciesMs = mutableListOf<Long>()
     private val connectLatencyLock = Any()
 
-    fun start() {
+    override fun start() {
         if (!running.compareAndSet(false, true)) {
             onLog("already running")
             return
@@ -337,7 +468,7 @@ private class QuicStabilityRunner(
         executor.execute { reportLoop() }
     }
 
-    fun stop() {
+    override fun stop() {
         running.set(false)
     }
 
