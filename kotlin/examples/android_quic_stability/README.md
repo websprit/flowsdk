@@ -10,7 +10,7 @@ Scenario:
 - Target host/port/server name: entered in the app UI
 - Username/password: entered in the app UI
 - Connections: `10`
-- Duration: `120s`
+- Duration: entered in the app UI, default `120s`
 - MQTT keep alive: `30s`
 - TLS verification: enabled
 - Publish/subscribe: disabled

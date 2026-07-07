@@ -44,6 +44,7 @@ class MainActivity : Activity() {
     private lateinit var serverNameInput: EditText
     private lateinit var usernameInput: EditText
     private lateinit var passwordInput: EditText
+    private lateinit var durationInput: EditText
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
 
@@ -59,7 +60,7 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(12), dp(16), dp(12))
             setTextIsSelectable(true)
             text = if (verifierInitialized) {
-                "Ready. Tap Start to hold 10 MQTT over QUIC connections for 120s.\n"
+                "Ready. Tap Start to hold MQTT over QUIC connections.\n"
             } else {
                 "Android platform verifier init failed. TLS verification may fail.\n"
             }
@@ -97,8 +98,14 @@ class MainActivity : Activity() {
             transformationMethod = AlwaysMaskedTransformationMethod
             setText(prefs.getString(PREF_PASSWORD, ""))
         }
+        durationInput = EditText(this).apply {
+            hint = "Duration seconds"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            setText(prefs.getString(PREF_DURATION_SECS, "120"))
+        }
         startButton = Button(this).apply {
-            text = "Start 10 connections / 120s"
+            text = "Start 10 connections"
             setOnClickListener {
                 logView.text = ""
                 runner?.stop()
@@ -109,6 +116,11 @@ class MainActivity : Activity() {
                 )
                 if (target == null) {
                     appendLog("Host and valid port are required.")
+                    return@setOnClickListener
+                }
+                val durationSecs = durationInput.text.toString().trim().toLongOrNull()
+                if (durationSecs == null || durationSecs <= 0) {
+                    appendLog("Valid duration seconds are required.")
                     return@setOnClickListener
                 }
                 hostInput.setText(target.host)
@@ -125,7 +137,7 @@ class MainActivity : Activity() {
                         username = usernameInput.text.toString().ifBlank { null },
                         password = passwordInput.text.toString().ifBlank { null },
                         clients = 10,
-                        durationSecs = 120,
+                        durationSecs = durationSecs,
                         keepAliveSecs = 30u,
                         insecureSkipVerify = false,
                     ),
@@ -173,6 +185,13 @@ class MainActivity : Activity() {
             )
             addView(
                 passwordInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(
+                durationInput,
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -253,6 +272,7 @@ class MainActivity : Activity() {
             .putString(PREF_SERVER_NAME, serverNameInput.text.toString().trim())
             .putString(PREF_USERNAME, usernameInput.text.toString())
             .putString(PREF_PASSWORD, passwordInput.text.toString())
+            .putString(PREF_DURATION_SECS, durationInput.text.toString().trim())
             .apply()
     }
 }
@@ -263,6 +283,7 @@ private const val PREF_PORT = "port"
 private const val PREF_SERVER_NAME = "server_name"
 private const val PREF_USERNAME = "username"
 private const val PREF_PASSWORD = "password"
+private const val PREF_DURATION_SECS = "duration_secs"
 
 private object PlatformVerifierNative {
     init {
