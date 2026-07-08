@@ -746,7 +746,7 @@ impl MqttEngineFFI {
     pub fn handle_incoming(&self, data: Vec<u8>) -> Vec<MqttEventFFI> {
         let mut engine = self.engine.lock().unwrap();
         let events = engine.handle_incoming(&data);
-        let mapped: Vec<_> = events.into_iter().map(map_event).collect();
+        let mapped: Vec<_> = events.into_iter().filter_map(map_event).collect();
         self.events.lock().unwrap().extend(mapped.iter().cloned());
         mapped
     }
@@ -755,7 +755,7 @@ impl MqttEngineFFI {
         let now = self.start_time + Duration::from_millis(now_ms);
         let mut engine = self.engine.lock().unwrap();
         let events = engine.handle_tick(now);
-        let mapped: Vec<_> = events.into_iter().map(map_event).collect();
+        let mapped: Vec<_> = events.into_iter().filter_map(map_event).collect();
         self.events.lock().unwrap().extend(mapped.iter().cloned());
         mapped
     }
@@ -781,7 +781,7 @@ impl MqttEngineFFI {
     pub fn take_events(&self) -> Vec<MqttEventFFI> {
         let mut events = std::mem::take(&mut *self.events.lock().unwrap());
         let engine_events = self.engine.lock().unwrap().take_events();
-        events.extend(engine_events.into_iter().map(map_event));
+        events.extend(engine_events.into_iter().filter_map(map_event));
         events
     }
 
@@ -848,43 +848,148 @@ impl MqttEngineFFI {
     }
 }
 
-fn map_event(event: MqttEvent) -> MqttEventFFI {
+fn map_event(event: MqttEvent) -> Option<MqttEventFFI> {
     match event {
-        MqttEvent::Connected(res) => MqttEventFFI::Connected(ConnectionResultFFI {
+        MqttEvent::Connected(res) => Some(MqttEventFFI::Connected(ConnectionResultFFI {
             reason_code: res.reason_code,
             session_present: res.session_present,
-        }),
-        MqttEvent::Disconnected(code) => MqttEventFFI::Disconnected { reason_code: code },
-        MqttEvent::MessageReceived(msg) => MqttEventFFI::MessageReceived(MqttMessageFFI {
+        })),
+        MqttEvent::Disconnected(code) => Some(MqttEventFFI::Disconnected { reason_code: code }),
+        MqttEvent::PublishReceived { .. } | MqttEvent::PubRelReceived { .. } => None,
+        MqttEvent::MessageReceived(msg) => Some(MqttEventFFI::MessageReceived(MqttMessageFFI {
             topic: msg.topic_name,
             payload: msg.payload,
             qos: msg.qos,
             retain: msg.retain,
-        }),
-        MqttEvent::Published(res) => MqttEventFFI::Published(PublishResultFFI {
+        })),
+        MqttEvent::Published(res) => Some(MqttEventFFI::Published(PublishResultFFI {
             packet_id: res.packet_id,
             reason_code: res.reason_code,
             qos: res.qos,
-        }),
-        MqttEvent::Subscribed(res) => MqttEventFFI::Subscribed(SubscribeResultFFI {
+        })),
+        MqttEvent::Subscribed(res) => Some(MqttEventFFI::Subscribed(SubscribeResultFFI {
             packet_id: res.packet_id,
             reason_codes: res.reason_codes,
-        }),
-        MqttEvent::Unsubscribed(res) => MqttEventFFI::Unsubscribed(UnsubscribeResultFFI {
+        })),
+        MqttEvent::Unsubscribed(res) => Some(MqttEventFFI::Unsubscribed(UnsubscribeResultFFI {
             packet_id: res.packet_id,
             reason_codes: res.reason_codes,
-        }),
-        MqttEvent::PingResponse(res) => MqttEventFFI::PingResponse {
+        })),
+        MqttEvent::PingResponse(res) => Some(MqttEventFFI::PingResponse {
             success: res.success,
-        },
-        MqttEvent::Error(err) => MqttEventFFI::Error {
+        }),
+        MqttEvent::Error(err) => Some(MqttEventFFI::Error {
             message: format!("{:?}", err),
-        },
-        MqttEvent::ReconnectNeeded => MqttEventFFI::ReconnectNeeded,
-        MqttEvent::ReconnectScheduled { attempt, delay } => MqttEventFFI::ReconnectScheduled {
-            attempt,
-            delay_ms: delay.as_millis() as u64,
-        },
+        }),
+        MqttEvent::TransportClosed { .. } => None,
+        MqttEvent::StreamClosed {
+            stream_id,
+            reason,
+            by_peer,
+        } => Some(MqttEventFFI::StreamClosed {
+            stream_id,
+            reason,
+            by_peer,
+        }),
+        MqttEvent::StreamReset {
+            stream_id,
+            error_code,
+        } => Some(MqttEventFFI::StreamReset {
+            stream_id,
+            error_code,
+        }),
+        MqttEvent::StreamStopped {
+            stream_id,
+            error_code,
+        } => Some(MqttEventFFI::StreamStopped {
+            stream_id,
+            error_code,
+        }),
+        MqttEvent::ZeroRttStatusChanged { .. } => None,
+        MqttEvent::ReconnectNeeded => Some(MqttEventFFI::ReconnectNeeded),
+        MqttEvent::ReconnectScheduled { attempt, delay } => {
+            Some(MqttEventFFI::ReconnectScheduled {
+                attempt,
+                delay_ms: delay.as_millis() as u64,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowsdk::mqtt_client::engine::QuicZeroRttStatus;
+    use std::time::Duration;
+
+    #[test]
+    fn zero_rtt_status_event_is_not_reported_as_ffi_error() {
+        let event = MqttEvent::ZeroRttStatusChanged {
+            status: QuicZeroRttStatus::Attempted,
+        };
+
+        assert!(map_event(event).is_none());
+    }
+
+    #[test]
+    fn transport_closed_event_is_not_reported_as_ffi_error() {
+        let event = MqttEvent::TransportClosed {
+            reason: "connection closed".to_string(),
+            by_peer: true,
+            error_code: Some(0),
+        };
+
+        assert!(map_event(event).is_none());
+    }
+
+    #[test]
+    fn maps_stream_and_reconnect_events() {
+        assert!(matches!(
+            map_event(MqttEvent::StreamClosed {
+                stream_id: 7,
+                reason: "recv_finished".to_string(),
+                by_peer: true,
+            }),
+            Some(MqttEventFFI::StreamClosed {
+                stream_id: 7,
+                by_peer: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            map_event(MqttEvent::StreamReset {
+                stream_id: 8,
+                error_code: 42,
+            }),
+            Some(MqttEventFFI::StreamReset {
+                stream_id: 8,
+                error_code: 42,
+            })
+        ));
+        assert!(matches!(
+            map_event(MqttEvent::StreamStopped {
+                stream_id: 9,
+                error_code: 43,
+            }),
+            Some(MqttEventFFI::StreamStopped {
+                stream_id: 9,
+                error_code: 43,
+            })
+        ));
+        assert!(matches!(
+            map_event(MqttEvent::ReconnectNeeded),
+            Some(MqttEventFFI::ReconnectNeeded)
+        ));
+        assert!(matches!(
+            map_event(MqttEvent::ReconnectScheduled {
+                attempt: 3,
+                delay: Duration::from_millis(250),
+            }),
+            Some(MqttEventFFI::ReconnectScheduled {
+                attempt: 3,
+                delay_ms: 250,
+            })
+        ));
     }
 }
 
@@ -1023,7 +1128,7 @@ impl TlsMqttEngineFFI {
     pub fn handle_tick(&self, now_ms: u64) -> Vec<MqttEventFFI> {
         let now = self.start_time + Duration::from_millis(now_ms);
         let events = self.engine.lock().unwrap().handle_tick(now);
-        let mapped: Vec<_> = events.into_iter().map(map_event).collect();
+        let mapped: Vec<_> = events.into_iter().filter_map(map_event).collect();
         self.events.lock().unwrap().extend(mapped.iter().cloned());
         mapped
     }
@@ -1031,7 +1136,7 @@ impl TlsMqttEngineFFI {
     pub fn take_events(&self) -> Vec<MqttEventFFI> {
         let mut events = std::mem::take(&mut *self.events.lock().unwrap());
         let engine_events = self.engine.lock().unwrap().take_events();
-        events.extend(engine_events.into_iter().map(map_event));
+        events.extend(engine_events.into_iter().filter_map(map_event));
         events
     }
 
@@ -1318,7 +1423,7 @@ impl QuicMqttEngineFFI {
         let now = self.start_time + Duration::from_millis(now_ms);
         let mut engine = self.engine.lock().unwrap();
         let events = engine.handle_tick(now);
-        let mapped: Vec<_> = events.into_iter().map(map_event).collect();
+        let mapped: Vec<_> = events.into_iter().filter_map(map_event).collect();
         self.events.lock().unwrap().extend(mapped.iter().cloned());
         mapped
     }
@@ -1326,7 +1431,7 @@ impl QuicMqttEngineFFI {
     pub fn take_events(&self) -> Vec<MqttEventFFI> {
         let mut events = std::mem::take(&mut *self.events.lock().unwrap());
         let engine_events = self.engine.lock().unwrap().take_events();
-        events.extend(engine_events.into_iter().map(map_event));
+        events.extend(engine_events.into_iter().filter_map(map_event));
         events
     }
 
@@ -2334,6 +2439,9 @@ pub unsafe extern "C" fn mqtt_event_list_get_tag(ptr: *const MqttEventListFFI, i
                 MqttEventFFI::Error { .. } => 8,
                 MqttEventFFI::ReconnectNeeded => 9,
                 MqttEventFFI::ReconnectScheduled { .. } => 10,
+                MqttEventFFI::StreamClosed { .. } => 11,
+                MqttEventFFI::StreamReset { .. } => 12,
+                MqttEventFFI::StreamStopped { .. } => 13,
             }
         } else {
             0
@@ -2450,6 +2558,78 @@ pub unsafe extern "C" fn mqtt_event_list_get_error_message(
         }
     }
     std::ptr::null_mut()
+}
+
+/// # Safety
+///
+/// This function is unsafe because it dereferences a raw pointer to `MqttEventListFFI`.
+#[no_mangle]
+pub unsafe extern "C" fn mqtt_event_list_get_stream_id(
+    ptr: *const MqttEventListFFI,
+    index: usize,
+) -> u64 {
+    if let Some(list) = ptr.as_ref() {
+        match list.events.get(index) {
+            Some(MqttEventFFI::StreamClosed { stream_id, .. })
+            | Some(MqttEventFFI::StreamReset { stream_id, .. })
+            | Some(MqttEventFFI::StreamStopped { stream_id, .. }) => *stream_id,
+            _ => 0,
+        }
+    } else {
+        0
+    }
+}
+
+/// # Safety
+///
+/// This function is unsafe because it dereferences a raw pointer to `MqttEventListFFI`.
+#[no_mangle]
+pub unsafe extern "C" fn mqtt_event_list_get_stream_error_code(
+    ptr: *const MqttEventListFFI,
+    index: usize,
+) -> u64 {
+    if let Some(list) = ptr.as_ref() {
+        match list.events.get(index) {
+            Some(MqttEventFFI::StreamReset { error_code, .. })
+            | Some(MqttEventFFI::StreamStopped { error_code, .. }) => *error_code,
+            _ => 0,
+        }
+    } else {
+        0
+    }
+}
+
+/// # Safety
+///
+/// This function is unsafe because it dereferences a raw pointer to `MqttEventListFFI`
+/// and returns an allocated `c_char` pointer that must be freed using `mqtt_engine_free_string`.
+#[no_mangle]
+pub unsafe extern "C" fn mqtt_event_list_get_stream_close_reason(
+    ptr: *const MqttEventListFFI,
+    index: usize,
+) -> *mut c_char {
+    if let Some(list) = ptr.as_ref() {
+        if let Some(MqttEventFFI::StreamClosed { reason, .. }) = list.events.get(index) {
+            return CString::new(reason.clone()).unwrap().into_raw();
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// # Safety
+///
+/// This function is unsafe because it dereferences a raw pointer to `MqttEventListFFI`.
+#[no_mangle]
+pub unsafe extern "C" fn mqtt_event_list_get_stream_closed_by_peer(
+    ptr: *const MqttEventListFFI,
+    index: usize,
+) -> i32 {
+    if let Some(list) = ptr.as_ref() {
+        if let Some(MqttEventFFI::StreamClosed { by_peer, .. }) = list.events.get(index) {
+            return i32::from(*by_peer);
+        }
+    }
+    -1
 }
 
 /// # Safety
