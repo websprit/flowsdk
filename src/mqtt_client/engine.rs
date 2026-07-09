@@ -45,6 +45,9 @@ use super::error::MqttClientError;
 use super::inflight::InflightQueue;
 use super::opts::MqttClientOptions;
 
+#[cfg(feature = "quic-proto")]
+const QUIC_CONTROL_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Alias for `MqttPublish` (v5) to provide a single, unified type for received messages.
 ///
 /// The engine normalizes all incoming PUBLISH packets (whether MQTT v3.1.1 or v5.0) into this structure.
@@ -1476,6 +1479,10 @@ pub struct QuicMqttEngine {
 
     // The primary bidirectional stream used for the MQTT handshake and control packets.
     control_stream: Option<StreamId>,
+    // Set after the QUIC handshake when the peer has not yet made a
+    // client-initiated bidirectional stream available. Retried on later ticks.
+    control_stream_open_pending: bool,
+    control_stream_open_pending_since: Option<Instant>,
 
     // Additional data streams (client- or server-initiated), keyed by raw QUIC stream id.
     // Each carries its own framing parser and outgoing buffer.
@@ -1491,6 +1498,11 @@ pub struct QuicMqttEngine {
     // (`send_raw_on` / `send_packet_on`), flushed alongside the engine's session
     // packets. Used for negative testing.
     control_outgoing: Vec<u8>,
+    quic_connected_seen: bool,
+    control_mqtt_connect_queued: bool,
+    control_bytes_queued_total: usize,
+    control_bytes_written_total: usize,
+    control_bytes_read_total: usize,
 
     // Connection parameters retained from the last `connect` so `reconnect` can
     // re-establish on the same endpoint without the caller rebuilding the config.
@@ -1541,10 +1553,17 @@ impl QuicMqttEngine {
             connection: None,
             connection_handle: None,
             control_stream: None,
+            control_stream_open_pending: false,
+            control_stream_open_pending_since: None,
             data_streams: HashMap::new(),
             default_pub_stream: None,
             default_sub_stream: None,
             control_outgoing: Vec::new(),
+            quic_connected_seen: false,
+            control_mqtt_connect_queued: false,
+            control_bytes_queued_total: 0,
+            control_bytes_written_total: 0,
+            control_bytes_read_total: 0,
             client_config: None,
             server_addr: None,
             server_name: None,
@@ -1680,9 +1699,10 @@ impl QuicMqttEngine {
         // Disable unreliable datagrams (buffer size 0 / None)
         let mut transport = quinn_proto::TransportConfig::default();
         transport.datagram_receive_buffer_size(None);
-        // Set max_idle_timeout to prevent QUIC from timing out before MQTT keepalive mechanism
-        // Use 120 seconds to accommodate MQTT keepalive (typically 30-60s) with 2x multiplier for safety
-        let idle_timeout = std::time::Duration::from_secs(120)
+        // Keep the QUIC path active independently from MQTT PINGREQ scheduling.
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        // Give idle QUIC paths enough tolerance for weak mobile networks while MQTT keepalive is active.
+        let idle_timeout = std::time::Duration::from_secs(300)
             .try_into()
             .map_err(|e| MqttClientError::InternalError {
                 message: format!("Failed to convert QUIC idle timeout: {}", e),
@@ -1779,6 +1799,8 @@ impl QuicMqttEngine {
                 status: QuicZeroRttStatus::Attempted,
             });
         self.control_stream = Some(stream_id);
+        self.control_stream_open_pending = false;
+        self.control_stream_open_pending_since = None;
         Self::journal_stream_open(
             &mut self.early_stream_journal,
             stream_id,
@@ -1786,6 +1808,10 @@ impl QuicMqttEngine {
         );
         self.mqtt_engine.connect();
         let connect_bytes = self.mqtt_engine.take_outgoing();
+        if !connect_bytes.is_empty() {
+            self.control_mqtt_connect_queued = true;
+            self.control_bytes_queued_total += connect_bytes.len();
+        }
         Self::append_control_outgoing_bytes(
             &mut self.control_outgoing,
             &mut self.early_stream_journal,
@@ -1876,10 +1902,17 @@ impl QuicMqttEngine {
         self.connection = None;
         self.connection_handle = None;
         self.control_stream = None;
+        self.control_stream_open_pending = false;
+        self.control_stream_open_pending_since = None;
         self.data_streams.clear();
         self.default_pub_stream = None;
         self.default_sub_stream = None;
         self.control_outgoing.clear();
+        self.quic_connected_seen = false;
+        self.control_mqtt_connect_queued = false;
+        self.control_bytes_queued_total = 0;
+        self.control_bytes_written_total = 0;
+        self.control_bytes_read_total = 0;
         self.outgoing_datagrams.clear();
         self.pending_close = None;
         self.control_finishing = false;
@@ -2113,6 +2146,44 @@ impl QuicMqttEngine {
         }
     }
 
+    fn try_open_pending_control_stream(
+        conn: &mut Connection,
+        control_stream: &mut Option<StreamId>,
+        control_stream_open_pending: &mut bool,
+        control_stream_open_pending_since: &mut Option<Instant>,
+        mqtt_engine: &mut MqttEngine,
+        control_mqtt_connect_queued: &mut bool,
+        now: Instant,
+        mqtt_events: &mut Vec<MqttEvent>,
+    ) {
+        if !*control_stream_open_pending || control_stream.is_some() {
+            return;
+        }
+
+        if let Some(stream_id) = conn.streams().open(Dir::Bi) {
+            *control_stream = Some(stream_id);
+            *control_stream_open_pending = false;
+            *control_stream_open_pending_since = None;
+            mqtt_engine.connect();
+            *control_mqtt_connect_queued = true;
+            return;
+        }
+
+        let pending_since = control_stream_open_pending_since.get_or_insert(now);
+        if now.duration_since(*pending_since) >= QUIC_CONTROL_STREAM_OPEN_TIMEOUT {
+            *control_stream_open_pending = false;
+            *control_stream_open_pending_since = None;
+            mqtt_engine.handle_connection_lost();
+            mqtt_events.push(MqttEvent::Error(MqttClientError::InternalError {
+                message: format!(
+                    "QUIC control stream open timed out after {}ms",
+                    QUIC_CONTROL_STREAM_OPEN_TIMEOUT.as_millis()
+                ),
+            }));
+            mqtt_events.push(MqttEvent::Disconnected(None));
+        }
+    }
+
     /// Open a fresh QUIC connection using the retained configuration.
     fn establish(&mut self, now: Instant) -> Result<(), MqttClientError> {
         let client_config =
@@ -2256,6 +2327,7 @@ impl QuicMqttEngine {
                         }
                     },
                     quinn_proto::Event::Connected => {
+                        self.quic_connected_seen = true;
                         let zero_rtt_was_attempted =
                             self.zero_rtt_status == QuicZeroRttStatus::Attempted;
 
@@ -2278,6 +2350,8 @@ impl QuicMqttEngine {
                                     .unwrap_or(false);
                                 let journals = std::mem::take(&mut self.early_stream_journal);
                                 self.control_stream = None;
+                                self.control_stream_open_pending = false;
+                                self.control_stream_open_pending_since = None;
                                 self.data_streams.clear();
                                 self.default_pub_stream = None;
                                 self.default_sub_stream = None;
@@ -2305,13 +2379,22 @@ impl QuicMqttEngine {
                         }
 
                         // QUIC handshake done. Open the control stream for MQTT
-                        // unless it already exists from 0-RTT or a rejected
-                        // attempt intentionally left retry to the caller.
+                        // unless it already exists from 0-RTT. If the peer's
+                        // bidirectional stream credit is not available yet, keep
+                        // retrying on later ticks instead of losing MQTT CONNECT.
                         if self.control_stream.is_none() && !zero_rtt_was_attempted {
-                            if let Some(stream_id) = conn.streams().open(Dir::Bi) {
-                                self.control_stream = Some(stream_id);
-                                self.mqtt_engine.connect();
-                            }
+                            self.control_stream_open_pending = true;
+                            self.control_stream_open_pending_since.get_or_insert(now);
+                            Self::try_open_pending_control_stream(
+                                conn,
+                                &mut self.control_stream,
+                                &mut self.control_stream_open_pending,
+                                &mut self.control_stream_open_pending_since,
+                                &mut self.mqtt_engine,
+                                &mut self.control_mqtt_connect_queued,
+                                now,
+                                &mut mqtt_events,
+                            );
                         }
                     }
                     quinn_proto::Event::ConnectionLost { reason } => {
@@ -2319,6 +2402,8 @@ impl QuicMqttEngine {
                         // replayed before CONNECT on the next transport.
                         self.mqtt_engine.reset_for_new_transport();
                         self.control_stream = None;
+                        self.control_stream_open_pending = false;
+                        self.control_stream_open_pending_since = None;
                         self.data_streams.clear();
                         self.default_pub_stream = None;
                         self.default_sub_stream = None;
@@ -2340,6 +2425,17 @@ impl QuicMqttEngine {
                     _ => {}
                 }
             }
+
+            Self::try_open_pending_control_stream(
+                conn,
+                &mut self.control_stream,
+                &mut self.control_stream_open_pending,
+                &mut self.control_stream_open_pending_since,
+                &mut self.mqtt_engine,
+                &mut self.control_mqtt_connect_queued,
+                now,
+                &mut mqtt_events,
+            );
 
             // 2. Accept server-initiated bidirectional streams as data streams.
             while let Some(stream_id) = conn.streams().accept(Dir::Bi) {
@@ -2382,6 +2478,7 @@ impl QuicMqttEngine {
                         loop {
                             match chunks.next(16384) {
                                 Ok(Some(chunk)) => {
+                                    self.control_bytes_read_total += chunk.bytes.len();
                                     mqtt_events
                                         .extend(self.mqtt_engine.handle_incoming(&chunk.bytes));
                                 }
@@ -2563,6 +2660,7 @@ impl QuicMqttEngine {
             // side and would block the deferred close below forever.
             if !self.control_finishing && !self.control_finished {
                 let session_bytes = self.mqtt_engine.take_outgoing();
+                self.control_bytes_queued_total += session_bytes.len();
                 Self::append_control_outgoing_bytes(
                     &mut self.control_outgoing,
                     &mut self.early_stream_journal,
@@ -2578,6 +2676,7 @@ impl QuicMqttEngine {
                 if !self.control_finished && !self.control_outgoing.is_empty() {
                     let mut stream = conn.send_stream(stream_id);
                     if let Ok(written) = stream.write(&self.control_outgoing) {
+                        self.control_bytes_written_total += written;
                         self.control_outgoing.drain(..written);
                     }
                 }
@@ -2669,6 +2768,38 @@ impl QuicMqttEngine {
 
     pub fn take_outgoing_datagrams(&mut self) -> VecDeque<(std::net::SocketAddr, Vec<u8>)> {
         std::mem::take(&mut self.outgoing_datagrams)
+    }
+
+    /// Return a compact QUIC/MQTT state snapshot for integration diagnostics.
+    pub fn debug_state_summary(&self, now: Instant) -> String {
+        let pending_open_elapsed_ms = self
+            .control_stream_open_pending_since
+            .and_then(|started| now.checked_duration_since(started))
+            .map(|elapsed| elapsed.as_millis());
+
+        format!(
+            "quic_present={} quic_connected_seen={} mqtt_connected={} control_stream={:?} control_stream_open_pending={} pending_open_elapsed_ms={:?} mqtt_connect_queued={} control_outgoing_bytes={} control_bytes_queued_total={} control_bytes_written_total={} control_bytes_read_total={} data_streams={} default_pub_stream={:?} default_sub_stream={:?} pending_transport_events={} outgoing_datagrams={} pending_close={} control_finishing={} control_finished={} zero_rtt_status={:?}",
+            self.connection.is_some(),
+            self.quic_connected_seen,
+            self.mqtt_engine.is_connected(),
+            self.control_stream.map(u64::from),
+            self.control_stream_open_pending,
+            pending_open_elapsed_ms,
+            self.control_mqtt_connect_queued,
+            self.control_outgoing.len(),
+            self.control_bytes_queued_total,
+            self.control_bytes_written_total,
+            self.control_bytes_read_total,
+            self.data_streams.len(),
+            self.default_pub_stream.map(u64::from),
+            self.default_sub_stream.map(u64::from),
+            self.pending_transport_events.len(),
+            self.outgoing_datagrams.len(),
+            self.pending_close.is_some(),
+            self.control_finishing,
+            self.control_finished,
+            self.zero_rtt_status,
+        )
     }
 
     pub fn take_events(&mut self) -> Vec<MqttEvent> {
@@ -4407,6 +4538,60 @@ mod tests {
         assert!(matches!(
             engine.open_data_stream(),
             Err(MqttClientError::InternalError { .. })
+        ));
+
+        // GIVEN: the MQTT control stream is pending for the same reason.
+        let pending_started = Instant::now();
+        engine.control_stream_open_pending = true;
+        engine.control_stream_open_pending_since = Some(pending_started);
+        let mut events = Vec::new();
+        {
+            let conn = engine.connection.as_mut().unwrap();
+            QuicMqttEngine::try_open_pending_control_stream(
+                conn,
+                &mut engine.control_stream,
+                &mut engine.control_stream_open_pending,
+                &mut engine.control_stream_open_pending_since,
+                &mut engine.mqtt_engine,
+                &mut engine.control_mqtt_connect_queued,
+                pending_started + Duration::from_secs(1),
+                &mut events,
+            );
+        }
+
+        // THEN: the pending state is preserved for a later tick instead of
+        // dropping the MQTT CONNECT attempt permanently.
+        assert!(engine.control_stream_open_pending);
+        assert_eq!(
+            engine.control_stream_open_pending_since,
+            Some(pending_started)
+        );
+        assert!(engine.control_stream.is_none());
+        assert!(engine.mqtt_engine.take_outgoing().is_empty());
+        assert!(events.is_empty());
+
+        // WHEN: the stream credit is still unavailable after the timeout.
+        {
+            let conn = engine.connection.as_mut().unwrap();
+            QuicMqttEngine::try_open_pending_control_stream(
+                conn,
+                &mut engine.control_stream,
+                &mut engine.control_stream_open_pending,
+                &mut engine.control_stream_open_pending_since,
+                &mut engine.mqtt_engine,
+                &mut engine.control_mqtt_connect_queued,
+                pending_started + QUIC_CONTROL_STREAM_OPEN_TIMEOUT,
+                &mut events,
+            );
+        }
+
+        // THEN: the engine stops retrying and reports the failed MQTT handshake.
+        assert!(!engine.control_stream_open_pending);
+        assert_eq!(engine.control_stream_open_pending_since, None);
+        assert!(engine.control_stream.is_none());
+        assert!(matches!(
+            events.as_slice(),
+            [MqttEvent::Error(_), MqttEvent::Disconnected(None)]
         ));
 
         // GIVEN: A connected MQTT session with one known QUIC data stream.

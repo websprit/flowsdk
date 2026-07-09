@@ -9,11 +9,21 @@ Scenario:
 
 - Target host/port/server name: entered in the app UI
 - Username/password: entered in the app UI
-- Connections: `10`
-- Duration: entered in the app UI, default `120s`
+- Concurrent connections: entered in the app UI, default `10`
+- Hold duration: entered in the app UI, default `120s`
+- Connect timeout: entered in the app UI, default `10s`
+- Connection attempts per client: entered in the app UI, default `1`
+- Reconnect interval: entered in the app UI, default `0s`
 - MQTT keep alive: `30s`
 - TLS verification: enabled
 - Publish/subscribe: disabled
+
+Connection attempts are counted per client. With `10` concurrent connections and `3`
+connection attempts, the native runner performs `30` total connection attempts.
+Each attempt waits up to the connect timeout for CONNACK. A successful attempt
+then stays connected for the hold duration, disconnects, and waits the reconnect
+interval before the next attempt. The final log prints both `connected` and
+`completed` success rates.
 
 The password field uses Android's password input mode, so the value is masked on screen.
 TLS verification uses Android's platform verifier via `rustls-platform-verifier`.

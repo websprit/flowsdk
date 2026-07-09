@@ -10,11 +10,14 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.text.method.TransformationMethod
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import java.net.InetSocketAddress
@@ -44,7 +47,14 @@ class MainActivity : Activity() {
     private lateinit var serverNameInput: EditText
     private lateinit var usernameInput: EditText
     private lateinit var passwordInput: EditText
+    private lateinit var clientsInput: EditText
     private lateinit var durationInput: EditText
+    private lateinit var connectTimeoutInput: EditText
+    private lateinit var connectionAttemptsInput: EditText
+    private lateinit var reconnectIntervalInput: EditText
+    private lateinit var runnerModeInput: RadioGroup
+    private lateinit var nativeRunnerButton: RadioButton
+    private lateinit var kotlinRunnerButton: RadioButton
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
 
@@ -98,14 +108,58 @@ class MainActivity : Activity() {
             transformationMethod = AlwaysMaskedTransformationMethod
             setText(prefs.getString(PREF_PASSWORD, ""))
         }
+        clientsInput = EditText(this).apply {
+            hint = "Concurrent connections"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            setText(prefs.getString(PREF_CLIENTS, "10"))
+        }
         durationInput = EditText(this).apply {
-            hint = "Duration seconds"
+            hint = "Hold duration seconds (per attempt)"
             inputType = InputType.TYPE_CLASS_NUMBER
             setSingleLine(true)
             setText(prefs.getString(PREF_DURATION_SECS, "120"))
         }
+        connectTimeoutInput = EditText(this).apply {
+            hint = "Connect timeout seconds"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            setText(prefs.getString(PREF_CONNECT_TIMEOUT_SECS, "10"))
+        }
+        connectionAttemptsInput = EditText(this).apply {
+            hint = "Connection attempts (per client)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            setText(prefs.getString(PREF_CONNECTION_ATTEMPTS, "1"))
+        }
+        reconnectIntervalInput = EditText(this).apply {
+            hint = "Reconnect interval seconds (between attempts)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            setText(prefs.getString(PREF_RECONNECT_INTERVAL_SECS, "0"))
+        }
+        nativeRunnerButton = RadioButton(this).apply {
+            text = "Native network"
+            id = View.generateViewId()
+        }
+        kotlinRunnerButton = RadioButton(this).apply {
+            text = "Kotlin network"
+            id = View.generateViewId()
+        }
+        runnerModeInput = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+            addView(nativeRunnerButton)
+            addView(kotlinRunnerButton)
+            check(
+                if (prefs.getString(PREF_RUNNER_MODE, RUNNER_NATIVE) == RUNNER_KOTLIN) {
+                    kotlinRunnerButton.id
+                } else {
+                    nativeRunnerButton.id
+                },
+            )
+        }
         startButton = Button(this).apply {
-            text = "Start 10 connections"
+            text = "Start"
             setOnClickListener {
                 logView.text = ""
                 runner?.stop()
@@ -118,9 +172,29 @@ class MainActivity : Activity() {
                     appendLog("Host and valid port are required.")
                     return@setOnClickListener
                 }
+                val clients = clientsInput.text.toString().trim().toIntOrNull()
+                if (clients == null || clients <= 0) {
+                    appendLog("Valid concurrent connections are required.")
+                    return@setOnClickListener
+                }
                 val durationSecs = durationInput.text.toString().trim().toLongOrNull()
                 if (durationSecs == null || durationSecs <= 0) {
                     appendLog("Valid duration seconds are required.")
+                    return@setOnClickListener
+                }
+                val connectTimeoutSecs = connectTimeoutInput.text.toString().trim().toLongOrNull()
+                if (connectTimeoutSecs == null || connectTimeoutSecs <= 0) {
+                    appendLog("Valid connect timeout seconds are required.")
+                    return@setOnClickListener
+                }
+                val connectionAttempts = connectionAttemptsInput.text.toString().trim().toIntOrNull()
+                if (connectionAttempts == null || connectionAttempts <= 0) {
+                    appendLog("Valid connection attempts are required.")
+                    return@setOnClickListener
+                }
+                val reconnectIntervalSecs = reconnectIntervalInput.text.toString().trim().toLongOrNull()
+                if (reconnectIntervalSecs == null || reconnectIntervalSecs < 0) {
+                    appendLog("Valid reconnect interval seconds are required.")
                     return@setOnClickListener
                 }
                 hostInput.setText(target.host)
@@ -129,20 +203,26 @@ class MainActivity : Activity() {
                     serverNameInput.setText("")
                 }
                 saveInputs()
-                val activeRunner = NativeQuicStabilityRunnerInstance(
-                    config = StabilityConfig(
-                        host = target.host,
-                        port = target.port,
-                        serverName = target.serverName,
-                        username = usernameInput.text.toString().ifBlank { null },
-                        password = passwordInput.text.toString().ifBlank { null },
-                        clients = 10,
-                        durationSecs = durationSecs,
-                        keepAliveSecs = 30u,
-                        insecureSkipVerify = false,
-                    ),
-                    onLog = ::appendLog,
+                val config = StabilityConfig(
+                    host = target.host,
+                    port = target.port,
+                    serverName = target.serverName,
+                    username = usernameInput.text.toString().ifBlank { null },
+                    password = passwordInput.text.toString().ifBlank { null },
+                    clients = clients,
+                    durationSecs = durationSecs,
+                    connectTimeoutSecs = connectTimeoutSecs,
+                    connectionAttempts = connectionAttempts,
+                    reconnectIntervalSecs = reconnectIntervalSecs,
+                    keepAliveSecs = 30u,
+                    insecureSkipVerify = false,
                 )
+                val activeRunner: StabilityRunner =
+                    if (runnerModeInput.checkedRadioButtonId == kotlinRunnerButton.id) {
+                        KotlinQuicStabilityRunner(config, ::appendLog)
+                    } else {
+                        NativeQuicStabilityRunnerInstance(config, ::appendLog)
+                    }
                 runner = activeRunner
                 activeRunner.start()
             }
@@ -191,7 +271,54 @@ class MainActivity : Activity() {
                 ),
             )
             addView(
+                clientsInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(
                 durationInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(
+                connectTimeoutInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(
+                connectionAttemptsInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(
+                reconnectIntervalInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(
+                runnerModeInput,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "Attempts run per client. Connect timeout is the maximum wait for CONNACK. Each successful connection is held for the hold duration, then disconnected; the interval is the wait before the next attempt."
+                    textSize = 12f
+                    setTextColor(Color.rgb(75, 85, 99))
+                    setPadding(dp(4), dp(2), dp(4), dp(8))
+                },
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -252,6 +379,7 @@ class MainActivity : Activity() {
     }
 
     private fun appendLog(line: String) {
+        Log.i(LOG_TAG, line)
         mainHandler.post {
             logView.append(line)
             logView.append("\n")
@@ -272,18 +400,38 @@ class MainActivity : Activity() {
             .putString(PREF_SERVER_NAME, serverNameInput.text.toString().trim())
             .putString(PREF_USERNAME, usernameInput.text.toString())
             .putString(PREF_PASSWORD, passwordInput.text.toString())
+            .putString(PREF_CLIENTS, clientsInput.text.toString().trim())
             .putString(PREF_DURATION_SECS, durationInput.text.toString().trim())
+            .putString(PREF_CONNECT_TIMEOUT_SECS, connectTimeoutInput.text.toString().trim())
+            .putString(PREF_CONNECTION_ATTEMPTS, connectionAttemptsInput.text.toString().trim())
+            .putString(PREF_RECONNECT_INTERVAL_SECS, reconnectIntervalInput.text.toString().trim())
+            .putString(
+                PREF_RUNNER_MODE,
+                if (runnerModeInput.checkedRadioButtonId == kotlinRunnerButton.id) {
+                    RUNNER_KOTLIN
+                } else {
+                    RUNNER_NATIVE
+                },
+            )
             .apply()
     }
 }
 
+private const val LOG_TAG = "FlowSdkQuicStability"
 private const val PREFS_NAME = "quic_stability_check"
 private const val PREF_HOST = "host"
 private const val PREF_PORT = "port"
 private const val PREF_SERVER_NAME = "server_name"
 private const val PREF_USERNAME = "username"
 private const val PREF_PASSWORD = "password"
+private const val PREF_CLIENTS = "clients"
 private const val PREF_DURATION_SECS = "duration_secs"
+private const val PREF_CONNECT_TIMEOUT_SECS = "connect_timeout_secs"
+private const val PREF_CONNECTION_ATTEMPTS = "connection_attempts"
+private const val PREF_RECONNECT_INTERVAL_SECS = "reconnect_interval_secs"
+private const val PREF_RUNNER_MODE = "runner_mode"
+private const val RUNNER_NATIVE = "native"
+private const val RUNNER_KOTLIN = "kotlin"
 
 private object PlatformVerifierNative {
     init {
@@ -326,6 +474,9 @@ private data class StabilityConfig(
     val password: String?,
     val clients: Int,
     val durationSecs: Long,
+    val connectTimeoutSecs: Long,
+    val connectionAttempts: Int,
+    val reconnectIntervalSecs: Long,
     val keepAliveSecs: UShort,
     val insecureSkipVerify: Boolean,
 )
@@ -399,6 +550,9 @@ private object NativeQuicStabilityRunner {
         password: String?,
         clients: Int,
         durationSecs: Long,
+        connectTimeoutSecs: Long,
+        connectionAttempts: Int,
+        reconnectIntervalSecs: Long,
         keepAliveSecs: Int,
         insecureSkipVerify: Boolean,
         callback: NativeLogCallback,
@@ -435,6 +589,9 @@ private class NativeQuicStabilityRunnerInstance(
             password = config.password,
             clients = config.clients,
             durationSecs = config.durationSecs,
+            connectTimeoutSecs = config.connectTimeoutSecs,
+            connectionAttempts = config.connectionAttempts,
+            reconnectIntervalSecs = config.reconnectIntervalSecs,
             keepAliveSecs = config.keepAliveSecs.toInt(),
             insecureSkipVerify = config.insecureSkipVerify,
             callback = NativeLogCallback(onLog),
@@ -462,6 +619,7 @@ private class KotlinQuicStabilityRunner(
     private val stats = StabilityStats()
     private val connectLatenciesMs = mutableListOf<Long>()
     private val connectLatencyLock = Any()
+    private val totalAttempts = config.clients.toLong() * config.connectionAttempts.toLong()
 
     override fun start() {
         if (!running.compareAndSet(false, true)) {
@@ -477,11 +635,16 @@ private class KotlinQuicStabilityRunner(
         onLog("  target: quic://${config.host}:${config.port}")
         onLog("  server_name: ${config.serverName}")
         onLog("  clients: ${config.clients}")
-        onLog("  duration: ${config.durationSecs}s")
+        onLog("  hold_duration: ${config.durationSecs}s")
+        onLog("  connect_timeout: ${config.connectTimeoutSecs}s")
+        onLog("  connection_attempts: ${config.connectionAttempts}")
+        onLog("  reconnect_interval: ${config.reconnectIntervalSecs}s")
+        onLog("  total_attempts: $totalAttempts")
         onLog("  keep_alive: ${config.keepAliveSecs}s")
         onLog("  publish/subscribe: disabled")
         onLog("  tls_verify: ${if (config.insecureSkipVerify) "off" else "on"}")
         onLog("  auth: ${if (config.username != null || config.password != null) "configured" else "disabled"}")
+        onLog("  runner: kotlin")
 
         repeat(config.clients) { index ->
             executor.execute { runClient(index) }
@@ -494,13 +657,37 @@ private class KotlinQuicStabilityRunner(
     }
 
     private fun runClient(index: Int) {
-        val startMs = System.currentTimeMillis()
+        for (attempt in 1..config.connectionAttempts) {
+            if (!running.get()) {
+                break
+            }
+            val startMs = System.currentTimeMillis()
+            val clientId = "android_quic_stability_kotlin_${startMs}_${index}_$attempt"
+            onLog("client $index attempt $attempt/${config.connectionAttempts} starting")
+            stats.connectionAttempts.incrementAndGet()
+            try {
+                runClientAttempt(index, attempt, startMs, clientId)
+            } catch (t: Throwable) {
+                stats.errors.incrementAndGet()
+                onLog("client $index attempt $attempt exception: ${t.message}")
+            } finally {
+                stats.finishedAttempts.incrementAndGet()
+            }
+            if (running.get() && attempt < config.connectionAttempts && config.reconnectIntervalSecs > 0) {
+                Thread.sleep(config.reconnectIntervalSecs * 1000)
+            }
+        }
+    }
+
+    private fun runClientAttempt(index: Int, attempt: Int, startMs: Long, clientId: String) {
+        val clientStartedNs = System.nanoTime()
         var channel: DatagramChannel? = null
         var selector: Selector? = null
+        var engine: QuicMqttEngineFfi? = null
 
         try {
             val opts = MqttOptionsFfi(
-                clientId = "android_quic_stability_${startMs}_$index",
+                clientId = clientId,
                 mqttVersion = 5.toUByte(),
                 cleanStart = true,
                 keepAlive = config.keepAliveSecs,
@@ -510,7 +697,7 @@ private class KotlinQuicStabilityRunner(
                 reconnectMaxDelayMs = 10000.toULong(),
                 maxReconnectAttempts = 0.toUInt(),
             )
-            val engine = QuicMqttEngineFfi(opts)
+            engine = QuicMqttEngineFfi(opts)
             val tlsOpts = MqttTlsOptionsFfi(
                 caCertFile = null,
                 clientCertFile = null,
@@ -522,6 +709,10 @@ private class KotlinQuicStabilityRunner(
 
             val brokerAddr = InetSocketAddress(config.host, config.port)
             channel = DatagramChannel.open().apply {
+                socket().receiveBufferSize = RECV_BUFFER_SIZE
+                if (index == 0 && attempt == 1) {
+                    onLog("UDP recv buffer requested=$RECV_BUFFER_SIZE actual=${socket().receiveBufferSize}")
+                }
                 configureBlocking(false)
                 connect(brokerAddr)
             }
@@ -537,10 +728,21 @@ private class KotlinQuicStabilityRunner(
             val recvBuf = ByteBuffer.allocateDirect(RECV_BUFFER_SIZE)
             var connected = false
             var completed = false
-            while (running.get() && System.currentTimeMillis() - startMs < config.durationSecs * 1000) {
+            var udpRecv = 0L
+            while (
+                running.get() &&
+                if (connected) {
+                    System.currentTimeMillis() - TimeUnit.NANOSECONDS.toMillis(clientStartedNs) < Long.MAX_VALUE &&
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - connectStartedNs) < Long.MAX_VALUE &&
+                        System.currentTimeMillis() - startMs < config.connectTimeoutSecs * 1000 + config.durationSecs * 1000
+                } else {
+                    System.currentTimeMillis() - startMs < config.connectTimeoutSecs * 1000
+                }
+            ) {
                 selector.select(TICK_INTERVAL_MS)
                 recvBuf.clear()
                 while (channel.receive(recvBuf) != null) {
+                    udpRecv++
                     recvBuf.flip()
                     val data = ByteArray(recvBuf.limit())
                     recvBuf.get(data)
@@ -559,11 +761,12 @@ private class KotlinQuicStabilityRunner(
                                     connectLatenciesMs.add(latencyMs)
                                 }
                                 stats.connected.incrementAndGet()
-                                onLog("client $index connected in ${latencyMs}ms")
+                                val totalMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - clientStartedNs)
+                                onLog("client $index attempt $attempt connected in ${latencyMs}ms total=${totalMs}ms")
                             } else if (event.v1.reasonCode.toInt() != 0) {
                                 stats.connectFailed.incrementAndGet()
-                                onLog("client $index connect rejected reason=${event.v1.reasonCode}")
-                                running.set(false)
+                                onLog("client $index attempt $attempt connect rejected reason=${event.v1.reasonCode}")
+                                return
                             }
                         }
                         is MqttEventFfi.PingResponse -> {
@@ -573,42 +776,52 @@ private class KotlinQuicStabilityRunner(
                         }
                         is MqttEventFfi.Disconnected -> {
                             stats.disconnected.incrementAndGet()
-                            onLog("client $index disconnected reason=${event.reasonCode}")
-                            running.set(false)
+                            onLog("client $index attempt $attempt disconnected reason=${event.reasonCode}")
+                            return
                         }
                         is MqttEventFfi.ReconnectNeeded -> {
                             stats.connectionLost.incrementAndGet()
-                            onLog("client $index connection lost: reconnect needed")
-                            running.set(false)
+                            onLog("client $index attempt $attempt connection lost: reconnect needed")
+                            return
                         }
                         is MqttEventFfi.Error -> {
                             stats.errors.incrementAndGet()
-                            onLog("client $index error: ${event.message}")
-                            running.set(false)
+                            onLog("client $index attempt $attempt error: ${event.message}")
+                            return
                         }
                         else -> Unit
                     }
                 }
                 sendOutgoing(engine, channel)
+                if (connected && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - connectStartedNs) >= config.durationSecs * 1000) {
+                    completed = true
+                    stats.completed.incrementAndGet()
+                    break
+                }
             }
 
-            val elapsed = System.currentTimeMillis() - startMs
-            val durationReached = elapsed >= config.durationSecs * 1000
-            if (connected && durationReached) {
-                completed = true
-                stats.completed.incrementAndGet()
+            if (!connected) {
+                stats.connectFailed.incrementAndGet()
+                onLog(
+                    "client $index attempt $attempt connect timeout after ${config.connectTimeoutSecs}s " +
+                        "udp_recv=$udpRecv",
+                )
             }
-            engine.disconnect()
-            engine.handleTick(nowMs(startMs))
-            sendOutgoing(engine, channel, failOnError = false)
             if (!completed && connected) {
-                onLog("client $index stopped before completion")
+                onLog("client $index attempt $attempt stopped before completion")
             }
         } catch (t: Throwable) {
             stats.errors.incrementAndGet()
-            onLog("client $index exception: ${t.message}")
-            running.set(false)
+            onLog("client $index attempt $attempt exception: ${t.message}")
         } finally {
+            try {
+                engine?.disconnect()
+                engine?.handleTick(nowMs(startMs))
+                if (engine != null && channel != null) {
+                    sendOutgoing(engine, channel, failOnError = false)
+                }
+            } catch (_: Throwable) {
+            }
             try {
                 selector?.close()
             } catch (_: Throwable) {
@@ -624,10 +837,11 @@ private class KotlinQuicStabilityRunner(
         while (running.get()) {
             Thread.sleep(5_000)
             onLog(snapshotLine())
-            if (stats.completed.get() >= config.clients.toLong()) {
+            if (stats.finishedAttempts.get() >= totalAttempts) {
                 running.set(false)
                 onLog("Final result")
                 onLog(snapshotLine())
+                onLog(connectionSuccessSummary())
                 onLog(connectLatencySummary())
                 val failed = stats.connectFailed.get() + stats.errors.get() +
                     stats.connectionLost.get() + stats.disconnected.get()
@@ -635,9 +849,10 @@ private class KotlinQuicStabilityRunner(
                 return
             }
         }
-        if (stats.completed.get() >= config.clients.toLong()) {
+        if (stats.finishedAttempts.get() >= totalAttempts) {
             onLog("Final result")
             onLog(snapshotLine())
+            onLog(connectionSuccessSummary())
             onLog(connectLatencySummary())
             val failed = stats.connectFailed.get() + stats.errors.get() +
                 stats.connectionLost.get() + stats.disconnected.get()
@@ -645,15 +860,31 @@ private class KotlinQuicStabilityRunner(
         } else {
             onLog("Stopped")
             onLog(snapshotLine())
+            onLog(connectionSuccessSummary())
             onLog(connectLatencySummary())
         }
     }
 
     private fun snapshotLine(): String =
-        "connected: ${stats.connected.get()} | completed: ${stats.completed.get()} | " +
+        "attempts: ${stats.connectionAttempts.get()} | finished: ${stats.finishedAttempts.get()} | " +
+            "connected: ${stats.connected.get()} | completed: ${stats.completed.get()} | " +
             "connect_failed: ${stats.connectFailed.get()} | ping_responses: ${stats.pingResponses.get()} | " +
-            "errors: ${stats.errors.get()} | connection_lost: ${stats.connectionLost.get()} | " +
-            "disconnected: ${stats.disconnected.get()}"
+            "errors: ${stats.errors.get()} | udp_send_failed: 0 | udp_send_recovered: 0 | " +
+            "connection_lost: ${stats.connectionLost.get()} | disconnected: ${stats.disconnected.get()}"
+
+    private fun connectionSuccessSummary(): String {
+        val attempts = stats.connectionAttempts.get().coerceAtLeast(1L)
+        return String.format(
+            Locale.US,
+            "connection_success_rate: connected=%d/%d (%.2f%%) | completed=%d/%d (%.2f%%)",
+            stats.connected.get(),
+            attempts,
+            stats.connected.get() * 100.0 / attempts,
+            stats.completed.get(),
+            attempts,
+            stats.completed.get() * 100.0 / attempts,
+        )
+    }
 
     private fun connectLatencySummary(): String {
         val values = synchronized(connectLatencyLock) { connectLatenciesMs.toList() }
@@ -675,6 +906,8 @@ private class KotlinQuicStabilityRunner(
 }
 
 private class StabilityStats {
+    val connectionAttempts = AtomicLong()
+    val finishedAttempts = AtomicLong()
     val connected = AtomicLong()
     val connectFailed = AtomicLong()
     val completed = AtomicLong()
@@ -684,6 +917,8 @@ private class StabilityStats {
     val disconnected = AtomicLong()
 
     fun reset() {
+        connectionAttempts.set(0)
+        finishedAttempts.set(0)
         connected.set(0)
         connectFailed.set(0)
         completed.set(0)
