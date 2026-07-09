@@ -1276,15 +1276,24 @@ pub struct TlsMqttEngineFFI {
 impl TlsMqttEngineFFI {
     #[cfg_attr(feature = "uniffi-bindings", uniffi::constructor)]
     pub fn new(opts: MqttOptionsFFI, tls_opts: MqttTlsOptionsFFI, server_name: String) -> Self {
-        let options = MqttClientOptions::builder()
+        let mut builder = MqttClientOptions::builder()
             .client_id(opts.client_id)
             .mqtt_version(opts.mqtt_version)
             .clean_start(opts.clean_start)
             .keep_alive(opts.keep_alive)
             .reconnect_base_delay_ms(opts.reconnect_base_delay_ms)
             .reconnect_max_delay_ms(opts.reconnect_max_delay_ms)
-            .max_reconnect_attempts(opts.max_reconnect_attempts)
-            .build();
+            .max_reconnect_attempts(opts.max_reconnect_attempts);
+
+        if let Some(username) = opts.username {
+            builder = builder.username(username);
+        }
+
+        if let Some(password) = opts.password {
+            builder = builder.password(password);
+        }
+
+        let options = builder.build();
 
         #[cfg(feature = "quic-openssl")]
         let _ = rustls_openssl::default_provider().install_default();
